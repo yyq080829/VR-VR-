@@ -1,0 +1,463 @@
+// ============================================================
+// HandTracking.cs - 手部骨骼追踪与旋前/旋后手势识别
+// v4 - 反射拦截版（无需修改HandLandmarkerRunner）
+//
+// 核心原理：
+//   利用反射获取 HandLandmarkerRunner 内部的 taskApi (HandLandmarker)
+//   然后通过反射替换其 resultCallback，在回调中同时：
+//   1) 调用原始回调（保证骨骼标注正常绘制）
+//   2) 将 HandLandmarkerResult 传给本脚本处理
+//
+//   旋前/旋后判断：
+//   利用 Wrist(0)、Index_MCP(5)、Pinky_MCP(17) 三个关键点
+//   计算手掌平面法向量 z 分量的符号
+//   - 右手: z > 0 → 旋后(手掌朝摄像头), z < 0 → 旋前(手背朝摄像头)
+//   - 左手: z < 0 → 旋后(手掌朝摄像头), z > 0 → 旋前(手背朝摄像头)
+//
+// 使用方式：
+//   1. 将此脚本挂载到场景中的任意 GameObject 上
+//   2. 确保场景中已有 HandLandmarkerRunner 在运行
+//   3. 无需修改 HandLandmarkerRunner，本脚本自动拦截回调
+//   4. 其他脚本可订阅 HandTracking.OnGestureDetected 事件
+//      获取 "Pronation" 或 "Supination" 字符串
+//   5. 可调用 HandTracking.GetCurrentOrientation() 查询当前方向
+//   6. 可调用 HandTracking.ResetGestureState() 重置检测基准
+// ============================================================
+
+using Mediapipe.Tasks.Components.Containers;
+using Mediapipe.Tasks.Vision.HandLandmarker;
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using UnityEngine;
+
+namespace Mediapipe.Unity.Sample.HandLandmarkDetection
+{
+    public class HandTracking : MonoBehaviour
+    {
+        // ============================================================
+        // 单例
+        // ============================================================
+        public static HandTracking Instance { get; private set; }
+
+        // ============================================================
+        // 公开事件：其他脚本（如GameLogic）可订阅此事件
+        // 参数为 "Pronation"（旋前）或 "Supination"（旋后）
+        // ============================================================
+        public static event Action<string> OnGestureDetected;
+
+        // ============================================================
+        // Inspector 参数
+        // ============================================================
+        [Header("=== 检测参数 ===")]
+        [Tooltip("确认帧数：连续N帧检测到同一方向才确认（越小越快，1=立即）")]
+        public int confirmationFrames = 2;
+
+        [Tooltip("检测冷却时间（秒）：确认一次手势后的最短间隔")]
+        public float detectionCooldown = 0.5f;
+
+        [Tooltip("法线Z阈值：|normalZ| > 此值才认为方向有效")]
+        public float normalZThreshold = 0.001f;
+
+        [Tooltip("是否检测左手（默认只检测右手）")]
+        public bool detectLeftHand = false;
+
+        // ============================================================
+        // 公开状态（供GameLogic等外部脚本读取）
+        // ============================================================
+        public static bool pronationDetected = false;
+        public static bool supinationDetected = false;
+
+        // ============================================================
+        // 内部状态
+        // ============================================================
+        private enum PalmOrientation { Unknown, Pronation, Supination }
+
+        private PalmOrientation lastConfirmedOrientation = PalmOrientation.Unknown;
+        private PalmOrientation pendingOrientation = PalmOrientation.Unknown;
+        private int confirmationCount = 0;
+        private float lastDetectionTime = -10f;
+        private float currentNormalZ = 0f;
+
+        // 数据接收统计
+        private int totalFramesReceived = 0;
+        private float startTime = 0f;
+        private bool callbackIntercepted = false;
+
+        // 反射缓存
+        private HandLandmarkerRunner runner;
+        private object handLandmarkerInstance;
+        private Delegate originalCallback;
+        private FieldInfo callbackFieldInfo;
+
+        // ============================================================
+        // 生命周期
+        // ============================================================
+
+        void Awake()
+        {
+            if (Instance != null && Instance != this)
+            {
+                Destroy(this);
+                return;
+            }
+            Instance = this;
+        }
+
+        void Start()
+        {
+            startTime = Time.time;
+            Debug.Log("[HandTracking] v4 启动，尝试通过反射拦截 HandLandmarkerRunner 回调...");
+
+            // 尝试拦截回调
+            TryInterceptCallback();
+
+            if (!callbackIntercepted)
+            {
+                Debug.LogWarning("[HandTracking] 反射拦截失败，将在 Update 中持续重试...");
+            }
+        }
+
+        void Update()
+        {
+            // 如果还没成功拦截，持续重试
+            if (!callbackIntercepted)
+            {
+                TryInterceptCallback();
+            }
+        }
+
+        void OnDestroy()
+        {
+            // 恢复原始回调
+            RestoreOriginalCallback();
+        }
+
+        // ============================================================
+        // 核心：反射拦截 HandLandmarkerRunner 的回调
+        // ============================================================
+
+        private void TryInterceptCallback()
+        {
+            try
+            {
+                // 1. 找到 HandLandmarkerRunner
+                if (runner == null)
+                {
+                    runner = FindObjectOfType<HandLandmarkerRunner>();
+                }
+                if (runner == null) return;
+
+                // 2. 获取 taskApi 字段（在基类 VisionTaskApiRunner<HandLandmarker> 中）
+                if (handLandmarkerInstance == null)
+                {
+                    Type runnerType = runner.GetType();
+                    Type baseType = runnerType.BaseType; // VisionTaskApiRunner<HandLandmarker>
+
+                    // 尝试多个可能的字段名
+                    string[] possibleFieldNames = { "taskApi", "_taskApi", "TaskApi" };
+                    FieldInfo taskApiField = null;
+
+                    // 先在基类中查找
+                    while (baseType != null && taskApiField == null)
+                    {
+                        foreach (string name in possibleFieldNames)
+                        {
+                            taskApiField = baseType.GetField(name,
+                                BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+                            if (taskApiField != null) break;
+                        }
+                        if (taskApiField == null) baseType = baseType.BaseType;
+                    }
+
+                    if (taskApiField == null) return;
+
+                    handLandmarkerInstance = taskApiField.GetValue(runner);
+                }
+
+                if (handLandmarkerInstance == null) return;
+
+                // 3. 在 HandLandmarker 实例中查找 resultCallback 字段
+                if (callbackFieldInfo == null)
+                {
+                    Type hlType = handLandmarkerInstance.GetType();
+                    Type currentType = hlType;
+
+                    string[] callbackFieldNames = { "resultCallback", "_resultCallback", "ResultCallback" };
+
+                    while (currentType != null && callbackFieldInfo == null)
+                    {
+                        foreach (string name in callbackFieldNames)
+                        {
+                            callbackFieldInfo = currentType.GetField(name,
+                                BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+                            if (callbackFieldInfo != null) break;
+                        }
+                        if (callbackFieldInfo == null) currentType = currentType.BaseType;
+                    }
+                }
+
+                if (callbackFieldInfo == null) return;
+
+                // 4. 获取原始回调
+                if (originalCallback == null)
+                {
+                    originalCallback = callbackFieldInfo.GetValue(handLandmarkerInstance) as Delegate;
+                }
+
+                // 5. 创建新回调并替换
+                HandLandmarkerOptions.ResultCallback newCallback = OnHandLandmarkerResult;
+                Delegate combined = Delegate.Combine(originalCallback, newCallback);
+                callbackFieldInfo.SetValue(handLandmarkerInstance, combined);
+
+                callbackIntercepted = true;
+                Debug.Log("[HandTracking] ★ 反射拦截成功！已挂载回调到 HandLandmarker");
+            }
+            catch (Exception e)
+            {
+                // 静默失败，下次重试
+                Debug.LogWarning("[HandTracking] 反射拦截异常: " + e.Message);
+            }
+        }
+
+        private void RestoreOriginalCallback()
+        {
+            try
+            {
+                if (callbackFieldInfo != null && handLandmarkerInstance != null && originalCallback != null)
+                {
+                    callbackFieldInfo.SetValue(handLandmarkerInstance, originalCallback);
+                    Debug.Log("[HandTracking] 已恢复原始回调");
+                }
+            }
+            catch { }
+        }
+
+        // ============================================================
+        // 回调处理：接收 HandLandmarkerResult
+        // ============================================================
+
+        /// <summary>
+        /// 供外部直接调用的数据接收方法（兼容旧版）
+        /// 如果反射拦截成功，此方法会被自动调用
+        /// 如果反射拦截失败，可手动在 HandLandmarkerRunner.OnHandLandmarkDetectionOutput 中调用
+        /// </summary>
+        public void ReceiveResult(HandLandmarkerResult result)
+        {
+            ProcessResult(result);
+        }
+
+        /// <summary>
+        /// 反射拦截的回调入口
+        /// </summary>
+        private void OnHandLandmarkerResult(HandLandmarkerResult result, Image image, long timestamp)
+        {
+            ProcessResult(result);
+        }
+
+        /// <summary>
+        /// 处理手部检测结果
+        /// </summary>
+        private void ProcessResult(HandLandmarkerResult result)
+        {
+            totalFramesReceived++;
+
+            // MediaPipe v0.16.3: handLandmarks 是 IList<NormalizedLandmarks>
+            // NormalizedLandmarks 是 struct，有 .landmarks 属性 (IList<NormalizedLandmark>)
+            if (result.handLandmarks == null || result.handLandmarks.Count == 0)
+            {
+                return;
+            }
+
+            // 取第一只检测到的手的 landmarks 列表
+            var normLandmarks = result.handLandmarks[0];
+            var landmarks = normLandmarks.landmarks;
+            if (landmarks == null || landmarks.Count < 21)
+            {
+                return;
+            }
+
+            // 获取关键点：Wrist(0), Index_MCP(5), Pinky_MCP(17)
+            var wrist = landmarks[0];
+            var indexMCP = landmarks[5];
+            var pinkyMCP = landmarks[17];
+
+            // 计算手掌平面法向量
+            // v1 = Index_MCP - Wrist
+            // v2 = Pinky_MCP - Wrist
+            // normal = v1 × v2
+            float v1x = indexMCP.x - wrist.x;
+            float v1y = indexMCP.y - wrist.y;
+            float v1z = indexMCP.z - wrist.z;
+
+            float v2x = pinkyMCP.x - wrist.x;
+            float v2y = pinkyMCP.y - wrist.y;
+            float v2z = pinkyMCP.z - wrist.z;
+
+            // 叉积
+            float nx = v1y * v2z - v1z * v2y;
+            float ny = v1z * v2x - v1x * v2z;
+            float nz = v1x * v2y - v1y * v2x;
+
+            currentNormalZ = nz;
+
+            // 判断方向
+            PalmOrientation currentOrientation = PalmOrientation.Unknown;
+            if (Mathf.Abs(nz) > normalZThreshold)
+            {
+                // 判断左右手
+                // 简化处理：使用 handedness 信息（如果有）
+                // 默认按右手判断
+                bool isRightHand = true;
+
+                // MediaPipe v0.16.3: handedness 是 IList<Classifications>
+                // Classifications 是 struct，有 .categories 属性 (IList<Category>)
+                if (result.handedness != null && result.handedness.Count > 0)
+                {
+                    var classifications = result.handedness[0];
+                    if (classifications.categories != null && classifications.categories.Count > 0)
+                    {
+                        var handedness = classifications.categories[0];
+                        string handLabel = handedness.categoryName;
+                        isRightHand = (handLabel == "Right");
+                    }
+                }
+
+                if (isRightHand)
+                {
+                    // 右手: z < 0 → 旋前(手背朝摄像头), z > 0 → 旋后(手掌朝摄像头)
+                    currentOrientation = nz < 0 ? PalmOrientation.Pronation : PalmOrientation.Supination;
+                }
+                else
+                {
+                    // 左手: z > 0 → 旋前(手背朝摄像头), z < 0 → 旋后(手掌朝摄像头)
+                    currentOrientation = nz > 0 ? PalmOrientation.Pronation : PalmOrientation.Supination;
+                }
+            }
+
+            // 确认机制
+            if (currentOrientation == PalmOrientation.Unknown)
+            {
+                confirmationCount = 0;
+                pendingOrientation = PalmOrientation.Unknown;
+                return;
+            }
+
+            if (currentOrientation == pendingOrientation)
+            {
+                confirmationCount++;
+            }
+            else
+            {
+                pendingOrientation = currentOrientation;
+                confirmationCount = 1;
+            }
+
+            // 达到确认帧数
+            if (confirmationCount >= confirmationFrames)
+            {
+                // 检查冷却时间
+                if (Time.time - lastDetectionTime >= detectionCooldown)
+                {
+                    // 方向发生变化才触发事件
+                    if (currentOrientation != lastConfirmedOrientation)
+                    {
+                        string gestureName = currentOrientation == PalmOrientation.Pronation ? "Pronation" : "Supination";
+                        string gestureCN = currentOrientation == PalmOrientation.Pronation ? "旋前" : "旋后";
+
+                        lastConfirmedOrientation = currentOrientation;
+                        lastDetectionTime = Time.time;
+
+                        Debug.Log("[HandTracking] ★ 检测到: " + gestureCN + " (" + gestureName + ") | normalZ=" + nz.ToString("F6"));
+
+                        // 触发事件
+                        OnGestureDetected?.Invoke(gestureName);
+
+                        // 更新公开标志
+                        if (gestureName == "Pronation") pronationDetected = true;
+                        if (gestureName == "Supination") supinationDetected = true;
+                    }
+                }
+
+                confirmationCount = 0;
+                pendingOrientation = PalmOrientation.Unknown;
+            }
+        }
+
+        // ============================================================
+        // 公开方法
+        // ============================================================
+
+        /// <summary>
+        /// 获取当前确认的手掌朝向
+        /// </summary>
+        public string GetCurrentOrientation()
+        {
+            return lastConfirmedOrientation == PalmOrientation.Pronation ? "Pronation"
+                 : lastConfirmedOrientation == PalmOrientation.Supination ? "Supination"
+                 : "Unknown";
+        }
+
+        /// <summary>
+        /// 静态方法：获取当前确认的手掌朝向
+        /// </summary>
+        public static string GetCurrentOrientationStatic()
+        {
+            if (Instance != null)
+            {
+                return Instance.GetCurrentOrientation();
+            }
+            return "Unknown";
+        }
+
+        /// <summary>
+        /// 重置检测状态
+        /// </summary>
+        public void ResetState()
+        {
+            lastConfirmedOrientation = PalmOrientation.Unknown;
+            pendingOrientation = PalmOrientation.Unknown;
+            confirmationCount = 0;
+            lastDetectionTime = -10f;
+            pronationDetected = false;
+            supinationDetected = false;
+            Debug.Log("[HandTracking] 检测状态已重置");
+        }
+
+        /// <summary>
+        /// 静态方法：重置手势检测状态
+        /// </summary>
+        public static void ResetGestureState()
+        {
+            if (Instance != null)
+            {
+                Instance.ResetState();
+            }
+        }
+
+        /// <summary>
+        /// 重置检测标志（不重置方向基准）
+        /// </summary>
+        public static void ResetDetectionFlags()
+        {
+            pronationDetected = false;
+            supinationDetected = false;
+        }
+
+        /// <summary>
+        /// 是否已成功拦截回调
+        /// </summary>
+        public static bool IsCallbackIntercepted()
+        {
+            return Instance != null && Instance.callbackIntercepted;
+        }
+
+        /// <summary>
+        /// 是否已收到手部数据
+        /// </summary>
+        public static bool HasReceivedData()
+        {
+            return Instance != null && Instance.totalFramesReceived > 0;
+        }
+    }
+}

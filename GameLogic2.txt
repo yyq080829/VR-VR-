@@ -1,0 +1,2288 @@
+/**
+ * GameLogic.cs - 星光舞台游戏全局逻辑控制器
+ * 
+ * 功能：
+ * - 每隔5秒随机触发一个交互事件（紫灯亮、粉灯亮、钢琴响等）
+ * - 紫灯亮时Purer Light出现并上下跳动+灯亮音效+曝光设为2.0；紫灯灭时Purer Light变黑+灯灭音效+曝光设为0.5
+ * - 粉灯亮时Pink Light出现并左右跳动+灯亮音效+曝光设为1.5；粉灯灭时Pink Light变黑+灯灭音效+曝光设为0.5
+ * - 灯全灭时曝光为0.5，正常状态曝光为1.0
+ * - 开场7颗星星依次出现，每颗出现时播放音效提示
+ * - 观众鼓掌/合唱：5s内上下+左右持续晃动，幅度较大
+ * - DJ开：播放DJ音效+DJ上下跳动5s
+ * - DJ关：关闭DJ音效+DJ更暗
+ * - 二人转：5s内一直旋转+音效
+ * - 人跳舞：5s内上下左右+转圈持续进行+音效
+ * - 人唱歌：5s内先转一圈，然后左右摇晃像歌手一样+歌曲音效
+ * - 钢琴响：Piano音效+Piano轻柔晃动（幅度较大）+Piano更亮
+ * - 每个物体出现2次，不可连续出现同一物体
+ * - 音频分段播放：第一次播放0-5s，第二次接续5-10s，以此类推
+ * - 每一个结束后进行下一个时，上一个动作和音频都要停止
+ * - 音效字段使用AudioClip格式，可直接拖入MP3文件
+ * - 同时保留BCI指令接收接口，供Link.cs调用
+ * 
+ * [NEW] 旋前旋后星星翻转功能：
+ * - 开场18s语音提示游戏规则
+ * - 用户做旋前/旋后手势控制星星翻转（7次翻转序列）
+ * - 每次翻转成功播放鼓励语音+星星跳动动画
+ * - 自动播放阶段：无物体交互时播放背景音乐，物体运动时停止
+ * 
+ * 使用方式：
+ * 1. 将此脚本挂载到场景中的空GameObject上（如GameManager）
+ * 2. 在Inspector中拖入对应的游戏物体
+ * 3. 在Inspector中直接拖入MP3音频文件到AudioClip字段
+ * 4. 在Inspector中配置P300参数映射表和自动播放参数
+ * 
+ * Unity版本：2022
+ */
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+// ============================================================
+// 数据结构定义
+// ============================================================
+
+/// <summary>
+/// 从Python后端接收的游戏指令数据结构
+/// 对应Python端 _convert_to_command 输出的JSON格式
+/// </summary>
+[Serializable]
+public class GameCommand
+{
+    /// <summary>指令类型：SELECT(P300/SSVEP), FORWARD/BACKWARD/IDLE(注意力), JUMP(眨眼), LEFT/RIGHT(陀螺仪), ACTION(运动想象)</summary>
+    public string cmd;
+
+    /// <summary>指令强度 0.0~1.0（注意力/陀螺仪等连续值指令使用）</summary>
+    public float intensity;
+
+    /// <summary>指令参数（P300/SSVEP的选中字符，MI的动作标识）</summary>
+    public string param;
+}
+
+/// <summary>
+/// P300参数到游戏事件的映射条目
+/// 在Inspector中配置，将HybridBCI平台输出的P300字符映射到具体的游戏动作
+/// </summary>
+[Serializable]
+public class P300MappingEntry
+{
+    [Tooltip("P300/SSVEP识别输出的参数值（对应HybridBCI平台配置的方格标识）")]
+    public string p300Param;
+
+    [Tooltip("对应的游戏事件类型")]
+    public GameEventType gameEvent;
+}
+
+/// <summary>
+/// 游戏事件类型枚举
+/// 定义所有支持的BCI触发游戏事件
+/// </summary>
+public enum GameEventType
+{
+    PurpleLightOn,      // 紫灯亮 - Purer Light出现+上下跳动
+    PurpleLightOff,     // 紫灯灭 - Purer Light变黑
+    PinkLightOn,        // 粉灯亮 - Pink Light出现+左右跳动
+    PinkLightOff,       // 粉灯灭 - Pink Light变黑
+    AudienceApplause,   // 观众鼓掌 - 上下+左右持续晃动（幅度大）
+    AudienceChorus,     // 观众合唱 - 上下+左右持续晃动（幅度大）
+    DJOn,               // DJ开 - DJ上下跳动
+    DJOff,              // DJ关 - DJ更暗
+    TwoGirlsSpin,       // 二人转旋转 - 5s内一直转
+    DancerDance,        // 人跳舞 - 上下左右+转圈5s内持续
+    SingerSing,         // 人唱歌 - 先转一圈再左右摇晃
+    PianoPlay           // 钢琴响 - 轻柔晃动（幅度较大）+更亮
+}
+
+// [NEW] 星星翻转步骤数据结构
+/// <summary>
+/// 星星翻转步骤数据
+/// 记录每次旋前旋后对应的星星、起始旋转和目标旋转
+/// </summary>
+[Serializable]
+public class StarFlipStep
+{
+    [Tooltip("要翻转的星星物体")]
+    public GameObject star;
+
+    [Tooltip("翻转前的旋转角度（Euler角）")]
+    public Vector3 startRotation;
+
+    [Tooltip("翻转后的旋转角度（Euler角）")]
+    public Vector3 endRotation;
+
+    [Tooltip("步骤名称（如star1、star2等，用于Console输出）")]
+    public string stepName;
+}
+
+// ============================================================
+// GameLogic 主类
+// ============================================================
+
+public class GameLogic : MonoBehaviour
+{
+    // ==================== 游戏物体引用 ====================
+
+    [Header("=== 灯光物体 ===")]
+    [Tooltip("紫灯物体（Purer Light）")]
+    public GameObject purerLight;
+
+    [Tooltip("粉灯物体（Pink Light）")]
+    public GameObject pinkLight;
+
+    [Header("=== 舞台物体 ===")]
+    [Tooltip("观众物体（Audience Applause）")]
+    public GameObject audienceApplause;
+
+    [Tooltip("DJ物体")]
+    public GameObject djObject;
+
+    [Tooltip("二人转物体（TwoGirls 2）")]
+    public GameObject twoGirls2;
+
+    [Tooltip("跳舞人物体（Dancer 3）")]
+    public GameObject dancer3;
+
+    [Tooltip("唱歌人物体（Singer）")]
+    public GameObject singer;
+
+    [Tooltip("钢琴物体（Piano）")]
+    public GameObject piano;
+
+    [Header("=== 星星物体 ===")]
+    [Tooltip("星星1")]
+    public GameObject star1;
+
+    [Tooltip("星星2")]
+    public GameObject star2;
+
+    [Tooltip("星星3")]
+    public GameObject star3;
+
+    [Tooltip("星星4")]
+    public GameObject star4;
+
+    [Tooltip("星星5")]
+    public GameObject star5;
+
+    [Tooltip("星星6")]
+    public GameObject star6;
+
+    [Tooltip("星星7")]
+    public GameObject star7;
+
+    // ==================== 音效资源（AudioClip格式，可直接拖入MP3） ====================
+
+    [Header("=== 音效资源（直接拖入MP3文件即可） ===")]
+    [Tooltip("灯亮音效（MP3/WAV等音频文件）")]
+    public AudioClip lightOnClip;
+
+    [Tooltip("灯灭音效（MP3/WAV等音频文件）")]
+    public AudioClip lightOffClip;
+
+    [Tooltip("观众鼓掌音效（MP3/WAV等音频文件）")]
+    public AudioClip applauseClip;
+
+    [Tooltip("观众合唱音效（MP3/WAV等音频文件）")]
+    public AudioClip chorusClip;
+
+    [Tooltip("DJ音效（MP3/WAV等音频文件）")]
+    public AudioClip djClip;
+
+    [Tooltip("二人转音效（MP3/WAV等音频文件）")]
+    public AudioClip twoGirlsClip;
+
+    [Tooltip("跳舞音效（MP3/WAV等音频文件）")]
+    public AudioClip dancerClip;
+
+    [Tooltip("唱歌音效（MP3/WAV等音频文件）")]
+    public AudioClip singerClip;
+
+    [Tooltip("钢琴音效（MP3/WAV等音频文件）")]
+    public AudioClip pianoClip;
+
+    [Tooltip("星星出现音效（MP3/WAV等音频文件）")]
+    public AudioClip starAppearClip;
+
+    // [NEW] ==================== 旋前旋后星星翻转音效资源 ====================
+
+    [Header("=== [NEW] 旋前旋后星星翻转音效 ===")]
+    [Tooltip("游戏规则语音提示（约18秒，开场播放）")]
+    public AudioClip ruleAnnouncementClip;
+
+    [Tooltip("星星翻转成功鼓励语音（每次翻转成功播放）")]
+    public AudioClip starFlipEncouragementClip;
+
+    [Tooltip("背景音乐（自动播放阶段无物体交互时循环播放）")]
+    public AudioClip backgroundMusicClip;
+
+    [Tooltip("旋前语音提示（规则播完后播放，提示用户做旋前动作）")]
+    public AudioClip pronationPromptClip;
+
+    [Tooltip("旋后语音提示（旋前完成后播放，提示用户做旋后动作）")]
+    public AudioClip supinationPromptClip;
+
+    // ==================== 自动播放参数 ====================
+
+    [Header("=== 自动播放参数 ===")]
+    [Tooltip("是否启用自动随机播放模式（每5秒随机触发一个交互）")]
+    public bool autoPlayEnabled = true;
+
+    [Tooltip("自动播放间隔（秒）")]
+    public float autoPlayInterval = 5f;
+
+    [Tooltip("灯光亮起后自动熄灭的延迟时间（秒）")]
+    public float lightAutoOffDelay = 5f;
+
+    [Tooltip("DJ开启后自动关闭的延迟时间（秒）")]
+    public float djAutoOffDelay = 5f;
+
+    [Tooltip("钢琴亮度恢复延迟时间（秒）")]
+    public float pianoBrightResetDelay = 5f;
+
+    [Tooltip("每个音频分段播放时长（秒），超长音频自动分段截取")]
+    public float maxAudioDuration = 5f;
+
+    // [NEW] ==================== 旋前旋后星星翻转参数 ====================
+
+    [Header("=== [NEW] 旋前旋后星星翻转参数 ===")]
+    [Tooltip("游戏规则语音播放时长（秒），默认18秒")]
+    public float ruleAnnouncementDuration = 18f;
+
+    [Tooltip("星星翻转动画时长（秒）")]
+    public float starFlipDuration = 1.0f;
+
+    [Tooltip("星星翻转后跳动动画时长（秒）")]
+    public float starBounceDuration = 1.5f;
+
+    [Tooltip("星星跳动幅度")]
+    public float starBounceAmplitude = 0.3f;
+
+    [Tooltip("星星翻转步骤列表（在Inspector中配置7个步骤）")]
+    public StarFlipStep[] starFlipSteps = new StarFlipStep[7];
+
+    // ==================== P300映射配置 ====================
+
+    [Header("=== P300参数映射 ===")]
+    [Tooltip("P300参数到游戏事件的映射表，根据HybridBCI平台方格配置填写")]
+    public List<P300MappingEntry> p300Mappings = new List<P300MappingEntry>()
+    {
+        new P300MappingEntry { p300Param = "1",  gameEvent = GameEventType.PurpleLightOn },
+        new P300MappingEntry { p300Param = "2",  gameEvent = GameEventType.PurpleLightOff },
+        new P300MappingEntry { p300Param = "3",  gameEvent = GameEventType.PinkLightOn },
+        new P300MappingEntry { p300Param = "4",  gameEvent = GameEventType.PinkLightOff },
+        new P300MappingEntry { p300Param = "5",  gameEvent = GameEventType.AudienceApplause },
+        new P300MappingEntry { p300Param = "6",  gameEvent = GameEventType.AudienceChorus },
+        new P300MappingEntry { p300Param = "7",  gameEvent = GameEventType.DJOn },
+        new P300MappingEntry { p300Param = "8",  gameEvent = GameEventType.DJOff },
+        new P300MappingEntry { p300Param = "9",  gameEvent = GameEventType.TwoGirlsSpin },
+        new P300MappingEntry { p300Param = "10", gameEvent = GameEventType.DancerDance },
+        new P300MappingEntry { p300Param = "11", gameEvent = GameEventType.SingerSing },
+        new P300MappingEntry { p300Param = "12", gameEvent = GameEventType.PianoPlay }
+    };
+
+    // ==================== 动画参数 ====================
+
+    [Header("=== 灯光动画参数 ===")]
+    [Tooltip("紫灯上下跳动幅度")]
+    public float lightBounceAmplitude = 0.5f;
+
+    [Tooltip("灯光跳动持续时间（秒）")]
+    public float lightBounceDuration = 5.0f;
+
+    [Tooltip("粉灯左右跳动幅度")]
+    public float pinkLightBounceAmplitude = 0.5f;
+
+    [Header("=== 观众动画参数 ===")]
+    [Tooltip("观众上下晃动幅度（鼓掌/合唱，幅度较大）")]
+    public float audienceBounceAmplitude = 0.4f;
+
+    [Tooltip("观众晃动持续时间（秒）")]
+    public float audienceDuration = 5.0f;
+
+    [Tooltip("观众左右晃动幅度（鼓掌/合唱，幅度较大）")]
+    public float audienceSwayAmplitude = 0.4f;
+
+    [Header("=== DJ动画参数 ===")]
+    [Tooltip("DJ上下跳动幅度")]
+    public float djBounceAmplitude = 0.5f;
+
+    [Tooltip("DJ跳动持续时间（秒）")]
+    public float djBounceDuration = 5.0f;
+
+    [Header("=== 二人转动画参数 ===")]
+    [Tooltip("二人转5s内旋转圈数")]
+    public int twoGirlsRotations = 3;
+
+    [Tooltip("二人转旋转总时间（秒）")]
+    public float twoGirlsSpinDuration = 5.0f;
+
+    [Header("=== 跳舞人动画参数 ===")]
+    [Tooltip("跳舞垂直跳动幅度")]
+    public float dancerVerticalAmplitude = 1.0f;
+
+    [Tooltip("跳舞水平跳动幅度")]
+    public float dancerHorizontalAmplitude = 0.5f;
+
+    [Tooltip("跳舞5s内旋转圈数")]
+    public int dancerRotations = 2;
+
+    [Tooltip("跳舞持续时间（秒）")]
+    public float dancerDuration = 5.0f;
+
+    [Header("=== 唱歌人动画参数 ===")]
+    [Tooltip("唱歌左右摇晃幅度")]
+    public float singerSwayAmplitude = 0.4f;
+
+    [Tooltip("唱歌表演总持续时间（秒）")]
+    public float singerDuration = 5.0f;
+
+    [Tooltip("唱歌人转圈阶段时长（秒）")]
+    public float singerRotateDuration = 1.5f;
+
+    [Header("=== 钢琴动画参数 ===")]
+    [Tooltip("钢琴轻柔晃动幅度（较大）")]
+    public float pianoSwayAmplitude = 0.3f;
+
+    [Tooltip("钢琴晃动持续时间（秒）")]
+    public float pianoSwayDuration = 5.0f;
+
+    [Header("=== 亮度参数 ===")]
+    [Tooltip("灯光亮度增加倍数（亮时）")]
+    public float lightBrightMultiplier = 2.0f;
+
+    [Tooltip("DJ亮度增加倍数")]
+    public float djBrightMultiplier = 2.0f;
+
+    [Tooltip("DJ亮度降低倍数（关时，小于1变暗）")]
+    public float djDimMultiplier = 0.5f;
+
+    [Tooltip("钢琴亮度增加倍数（稍微更亮）")]
+    public float pianoBrightMultiplier = 1.5f;
+
+    [Header("=== 曝光参数 ===")]
+    [Tooltip("粉灯亮时曝光值")]
+    public float pinkLightExposure = 1.5f;
+
+    [Tooltip("紫灯亮时曝光值")]
+    public float purpleLightExposure = 2.0f;
+
+    [Tooltip("灯灭时曝光值")]
+    public float lightOffExposure = 0.5f;
+
+    [Tooltip("正常曝光值")]
+    public float normalExposure = 1.0f;
+
+    [Header("=== 星星出场参数 ===")]
+    [Tooltip("星星依次出现间隔（秒）")]
+    public float starAppearInterval = 1.0f;
+
+    // ==================== 内部状态 ====================
+
+    /// <summary>当前正在运行的协程字典，用于防止重复触发</summary>
+    private Dictionary<string, Coroutine> activeCoroutines = new Dictionary<string, Coroutine>();
+
+    /// <summary>自动播放协程引用</summary>
+    private Coroutine autoPlayCoroutine;
+
+    /// <summary>各物体原始材质颜色缓存</summary>
+    private Dictionary<GameObject, Color> originalColors = new Dictionary<GameObject, Color>();
+
+    /// <summary>各物体原始Emission颜色缓存</summary>
+    private Dictionary<GameObject, Color> originalEmissions = new Dictionary<GameObject, Color>();
+
+    /// <summary>各物体原始位置缓存，用于动画结束后复位</summary>
+    private Dictionary<GameObject, Vector3> originalPositions = new Dictionary<GameObject, Vector3>();
+
+    /// <summary>各物体原始旋转缓存，用于动画结束后复位</summary>
+    private Dictionary<GameObject, Quaternion> originalRotations = new Dictionary<GameObject, Quaternion>();
+
+    /// <summary>自动随机播放的事件池（只包含"触发型"事件，灯灭/DJ关由亮/开后自动触发）</summary>
+    private readonly GameEventType[] autoPlayEventPool = new GameEventType[]
+    {
+        GameEventType.PurpleLightOn,
+        GameEventType.PinkLightOn,
+        GameEventType.AudienceApplause,
+        GameEventType.AudienceChorus,
+        GameEventType.DJOn,
+        GameEventType.TwoGirlsSpin,
+        GameEventType.DancerDance,
+        GameEventType.SingerSing,
+        GameEventType.PianoPlay
+    };
+
+    /// <summary>自动播放触发计数（每个事件出现2次后重置）</summary>
+    private Dictionary<GameEventType, int> eventTriggerCounts = new Dictionary<GameEventType, int>();
+
+    /// <summary>上一次触发的事件类型，用于避免连续重复</summary>
+    private GameEventType lastTriggeredEvent;
+
+    /// <summary>DJ是否处于开启状态</summary>
+    private bool isDJOn = false;
+
+    /// <summary>紫灯是否处于开启状态</summary>
+    private bool isPurpleLightOn = false;
+
+    /// <summary>粉灯是否处于开启状态</summary>
+    private bool isPinkLightOn = false;
+
+    /// <summary>星星出场序列是否已完成</summary>
+    private bool starSequenceComplete = false;
+
+    /// <summary>本物体上的AudioSource组件，运行时自动获取或创建</summary>
+    private AudioSource audioSource;
+
+    /// <summary>当前正在播放的音频截断协程引用</summary>
+    private Coroutine audioStopCoroutine;
+
+    /// <summary>各事件类型的音频分段播放计数（第一次0-5s，第二次5-10s，以此类推）</summary>
+    private Dictionary<GameEventType, int> audioPlayCounts = new Dictionary<GameEventType, int>();
+
+    // [NEW] ==================== 旋前旋后星星翻转内部状态 ====================
+
+    /// <summary>当前星星翻转步骤索引（0~6，共7步）</summary>
+    private int currentStarFlipStep = 0;
+
+    /// <summary>是否处于星星翻转阶段（等待用户旋前旋后手势）</summary>
+    private bool starFlipPhaseActive = false;
+
+    /// <summary>是否正在执行星星翻转动画（防止翻转动画期间重复触发）</summary>
+    private bool isStarFlipping = false;
+
+    /// <summary>是否正在等待用户做旋前手势（练习阶段）</summary>
+    private bool waitingForPronation = false;
+
+    /// <summary>是否正在等待用户做旋后手势（练习阶段）</summary>
+    private bool waitingForSupination = false;
+
+    /// <summary>旋前手势是否已被检测到</summary>
+    private bool pronationDetected = false;
+
+    /// <summary>旋后手势是否已被检测到</summary>
+    private bool supinationDetected = false;
+
+    /// <summary>背景音乐专用AudioSource（独立于主音效AudioSource）</summary>
+    private AudioSource bgMusicAudioSource;
+
+    /// <summary>背景音乐管理协程引用</summary>
+    private Coroutine bgMusicManagerCoroutine;
+
+    // ============================================================
+    // 生命周期方法
+    // ============================================================
+
+    void Start()
+    {
+        // 获取或创建主AudioSource组件
+        audioSource = GetComponent<AudioSource>();
+        if (audioSource == null)
+        {
+            audioSource = gameObject.AddComponent<AudioSource>();
+        }
+        audioSource.playOnAwake = false;
+        audioSource.loop = false;
+
+        // [NEW] 创建背景音乐专用AudioSource
+        bgMusicAudioSource = gameObject.AddComponent<AudioSource>();
+        bgMusicAudioSource.playOnAwake = false;
+        bgMusicAudioSource.loop = true;
+        bgMusicAudioSource.volume = 0.5f;
+
+        // [NEW] 初始化星星翻转步骤数据（如果Inspector未配置，则使用默认值）
+        InitializeStarFlipSteps();
+
+        // 记录所有物体的原始材质颜色（在修改之前）
+        StoreOriginalColor(purerLight);
+        StoreOriginalColor(pinkLight);
+        StoreOriginalColor(djObject);
+        StoreOriginalColor(piano);
+        StoreOriginalColor(singer);
+        StoreOriginalColor(audienceApplause);
+        StoreOriginalColor(twoGirls2);
+        StoreOriginalColor(dancer3);
+
+        // 记录所有物体的原始位置
+        StoreOriginalPosition(purerLight);
+        StoreOriginalPosition(pinkLight);
+        StoreOriginalPosition(djObject);
+        StoreOriginalPosition(piano);
+        StoreOriginalPosition(singer);
+        StoreOriginalPosition(audienceApplause);
+        StoreOriginalPosition(twoGirls2);
+        StoreOriginalPosition(dancer3);
+
+        // 记录所有物体的原始旋转
+        StoreOriginalRotation(purerLight);
+        StoreOriginalRotation(pinkLight);
+        StoreOriginalRotation(djObject);
+        StoreOriginalRotation(piano);
+        StoreOriginalRotation(singer);
+        StoreOriginalRotation(audienceApplause);
+        StoreOriginalRotation(twoGirls2);
+        StoreOriginalRotation(dancer3);
+
+        // 初始化灯光物体为黑色（可见但灯灭状态，不再隐藏）
+        SetObjectBlack(purerLight);
+        SetObjectBlack(pinkLight);
+
+        // 初始化曝光为正常值
+        SetExposure(normalExposure);
+
+        // 初始化所有星星为隐藏状态
+        HideStar(star1);
+        HideStar(star2);
+        HideStar(star3);
+        HideStar(star4);
+        HideStar(star5);
+        HideStar(star6);
+        HideStar(star7);
+
+        // 初始化触发计数
+        ResetTriggerCounts();
+        lastTriggeredEvent = autoPlayEventPool[0];
+
+        // 初始化音频分段播放计数
+        foreach (GameEventType eventType in autoPlayEventPool)
+        {
+            audioPlayCounts[eventType] = 0;
+        }
+
+        // [NEW] 订阅HandTracking的旋前旋后手势检测事件
+        Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.OnGestureDetected += OnHandGestureDetected;
+
+        // 启动星星出场序列，完成后自动进入规则语音+星星翻转阶段
+        StartCoroutine(StarAppearanceSequence());
+
+        Debug.Log("[GameLogic] 星光舞台游戏逻辑初始化完成，等待星星出场序列...");
+    }
+
+    void OnDestroy()
+    {
+        StopAllCoroutines();
+        activeCoroutines.Clear();
+
+        // [NEW] 取消订阅HandTracking事件
+        Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.OnGestureDetected -= OnHandGestureDetected;
+    }
+
+    // ============================================================
+    // [NEW] 旋前旋后星星翻转功能
+    // ============================================================
+
+    /// <summary>
+    /// 初始化星星翻转步骤数据
+    /// 如果Inspector中未配置starFlipSteps，则使用代码中的默认值
+    /// </summary>
+    private void InitializeStarFlipSteps()
+    {
+        // 检查是否已在Inspector中配置了步骤
+        bool hasValidConfig = false;
+        if (starFlipSteps != null && starFlipSteps.Length == 7)
+        {
+            foreach (var step in starFlipSteps)
+            {
+                if (step.star != null)
+                {
+                    hasValidConfig = true;
+                    break;
+                }
+            }
+        }
+
+        // 如果Inspector已配置，则使用Inspector的值；否则使用默认值
+        if (hasValidConfig) return;
+
+        // 默认翻转步骤配置
+        starFlipSteps = new StarFlipStep[7];
+
+        // 第1次：star1 从 (-185, -328, 5.8) 翻转到 (-175.704, -140.294, -6.557983)
+        starFlipSteps[0] = new StarFlipStep
+        {
+            star = star1,
+            startRotation = new Vector3(-185f, -328f, 5.8f),
+            endRotation = new Vector3(-175.704f, -140.294f, -6.557983f),
+            stepName = "star1"
+        };
+
+        // 第2次：star2 从 (-180, -316.864, 0) 翻转到 (-180, -316.864, 0)
+        // 注意：起始和目标旋转相同，可能是笔误，此处按需求原样实现
+        starFlipSteps[1] = new StarFlipStep
+        {
+            star = star2,
+            startRotation = new Vector3(-180f, -316.864f, 0f),
+            endRotation = new Vector3(-180f, -316.864f, 0f),
+            stepName = "star2"
+        };
+
+        // 第3次：star3 从 (-180, -327, 0) 翻转到 (-180, -509, 0)
+        starFlipSteps[2] = new StarFlipStep
+        {
+            star = star3,
+            startRotation = new Vector3(-180f, -327f, 0f),
+            endRotation = new Vector3(-180f, -509f, 0f),
+            stepName = "star3"
+        };
+
+        // 第4次：star4 从 (-179.9, -352, 16.4) 翻转到 (-186, -510, -15)
+        starFlipSteps[3] = new StarFlipStep
+        {
+            star = star4,
+            startRotation = new Vector3(-179.9f, -352f, 16.4f),
+            endRotation = new Vector3(-186f, -510f, -15f),
+            stepName = "star4"
+        };
+
+        // 第5次：star5 从 (-180, -330, 0) 翻转到 (-180, -521, 0)
+        starFlipSteps[4] = new StarFlipStep
+        {
+            star = star5,
+            startRotation = new Vector3(-180f, -330f, 0f),
+            endRotation = new Vector3(-180f, -521f, 0f),
+            stepName = "star5"
+        };
+
+        // 第6次：star6 从 (-180, -352, 0) 翻转到 (-180, -165, 0)
+        starFlipSteps[5] = new StarFlipStep
+        {
+            star = star6,
+            startRotation = new Vector3(-180f, -352f, 0f),
+            endRotation = new Vector3(-180f, -165f, 0f),
+            stepName = "star6"
+        };
+
+        // 第7次：star3 从 (-165, -329, 37.7) 翻转到 (-200, -500, -35)
+        // 注意：第7次再次翻转star3，起始旋转与第3次不同
+        starFlipSteps[6] = new StarFlipStep
+        {
+            star = star3,
+            startRotation = new Vector3(-165f, -329f, 37.7f),
+            endRotation = new Vector3(-200f, -500f, -35f),
+            stepName = "star3(2nd)"
+        };
+    }
+
+    /// <summary>
+    /// HandTracking手势检测回调
+    /// 当检测到旋前或旋后手势时被调用
+    /// </summary>
+    /// <param name="gesture">"Pronation"（旋前）或 "Supination"（旋后）</param>
+    private void OnHandGestureDetected(string gesture)
+    {
+        Debug.Log("[GameLogic] OnHandGestureDetected: " + gesture);
+        // 新版7步翻转阶段直接在协程中轮询HandTracking的标志，
+        // 不再依赖此事件回调驱动翻转逻辑。此回调仅用于日志。
+    }
+
+    /// <summary>
+    /// 执行当前步骤的星星翻转
+    /// 启动翻转动画协程，翻转完成后播放鼓励语音和跳动动画
+    /// </summary>
+    private void FlipCurrentStar()
+    {
+        if (currentStarFlipStep >= starFlipSteps.Length) return;
+
+        StarFlipStep step = starFlipSteps[currentStarFlipStep];
+        if (step.star == null)
+        {
+            Debug.LogWarning("[GameLogic] 星星翻转步骤 " + currentStarFlipStep + " 的星星物体为空，跳过");
+            currentStarFlipStep++;
+            return;
+        }
+
+        isStarFlipping = true;
+        SafeStartCoroutine("StarFlip_" + step.stepName,
+            StarFlipCoroutine(step.star, step.startRotation, step.endRotation, step.stepName));
+    }
+
+    /// <summary>
+    /// 星星翻转动画协程
+    /// 先将星星旋转到起始角度，然后平滑旋转到目标角度
+    /// 翻转完成后播放鼓励语音并启动跳动动画
+    /// </summary>
+    private IEnumerator StarFlipCoroutine(GameObject star, Vector3 startEuler, Vector3 endEuler, string stepName)
+    {
+        // 确保星星可见
+        if (!star.activeSelf)
+        {
+            star.SetActive(true);
+        }
+
+        // 设置起始旋转
+        star.transform.localEulerAngles = startEuler;
+
+        // 平滑旋转到目标角度
+        float elapsed = 0f;
+        while (elapsed < starFlipDuration)
+        {
+            float progress = elapsed / starFlipDuration;
+            // 使用缓入缓出插值，使翻转更自然
+            float easedProgress = progress * progress * (3f - 2f * progress);
+            Vector3 currentEuler = Vector3.Lerp(startEuler, endEuler, easedProgress);
+            star.transform.localEulerAngles = currentEuler;
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 确保最终角度精确
+        star.transform.localEulerAngles = endEuler;
+
+        // 翻转成功！输出到Console
+        Debug.Log("[GameLogic] " + stepName + " 翻转成功！");
+
+        // 播放鼓励语音
+        if (starFlipEncouragementClip != null && audioSource != null)
+        {
+            audioSource.PlayOneShot(starFlipEncouragementClip);
+        }
+
+        // 启动星星跳动动画
+        SafeStartCoroutine("StarBounce_" + stepName,
+            StarBounceCoroutine(star, "StarBounce_" + stepName, starBounceDuration, starBounceAmplitude));
+
+        // 更新步骤索引
+        currentStarFlipStep++;
+        isStarFlipping = false;
+
+        // 检查是否所有翻转都已完成
+        if (currentStarFlipStep >= starFlipSteps.Length)
+        {
+            Debug.Log("[GameLogic] 所有7次星星翻转已完成！进入自动播放阶段...");
+            starFlipPhaseActive = false;
+
+            // 启动自动播放协程
+            if (autoPlayEnabled)
+            {
+                autoPlayCoroutine = StartCoroutine(AutoPlayCoroutine());
+            }
+
+            // [NEW] 启动背景音乐管理协程
+            if (bgMusicManagerCoroutine != null)
+            {
+                StopCoroutine(bgMusicManagerCoroutine);
+            }
+            bgMusicManagerCoroutine = StartCoroutine(BackgroundMusicManager());
+        }
+    }
+
+    /// <summary>
+    /// 星星翻转后跳动动画协程
+    /// 上下左右跳动，营造欢快效果
+    /// </summary>
+    private IEnumerator StarBounceCoroutine(GameObject star, string key, float duration, float amplitude)
+    {
+        if (star == null) yield break;
+
+        Vector3 basePos = star.transform.localPosition;
+        float elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            // 上下弹跳（绝对值正弦波，模拟弹跳感）
+            float offsetY = Mathf.Abs(Mathf.Sin(elapsed * 8f)) * amplitude;
+            // 左右摆动（正弦波，频率稍低）
+            float offsetX = Mathf.Sin(elapsed * 5f) * amplitude * 0.6f;
+            star.transform.localPosition = basePos + new Vector3(offsetX, offsetY, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始位置
+        star.transform.localPosition = basePos;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 单颗星星翻转180度协程（7步翻转阶段使用）
+    /// 从startEuler平滑旋转到endEuler
+    /// </summary>
+    private IEnumerator FlipStar180Coroutine(GameObject star, Vector3 startEuler, Vector3 endEuler, string stepName)
+    {
+        if (star == null) yield break;
+
+        // 设置起始旋转
+        star.transform.localEulerAngles = startEuler;
+
+        // 平滑旋转到目标角度
+        float elapsed = 0f;
+        while (elapsed < starFlipDuration)
+        {
+            float progress = elapsed / starFlipDuration;
+            float easedProgress = progress * progress * (3f - 2f * progress);
+            star.transform.localEulerAngles = Vector3.Lerp(startEuler, endEuler, easedProgress);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 确保最终角度精确
+        star.transform.localEulerAngles = endEuler;
+    }
+
+    /// <summary>
+    /// 旋前/旋后练习阶段：所有星星同时rotation变化后再上下左右跳动
+    /// toEndRotation=true: 所有星星从startRotation翻转到endRotation（旋前）
+    /// toEndRotation=false: 所有星星从endRotation翻转回startRotation（旋后）
+    /// </summary>
+    private IEnumerator FlipAllStarsSequence(bool toEndRotation)
+    {
+        isStarFlipping = true;
+
+        GameObject[] stars = new GameObject[] { star1, star2, star3, star4, star5, star6, star7 };
+
+        // ====== 阶段1：所有星星同时rotation变化 ======
+        float elapsed = 0f;
+        while (elapsed < starFlipDuration)
+        {
+            float progress = elapsed / starFlipDuration;
+            // Smoothstep缓动
+            float easedProgress = progress * progress * (3f - 2f * progress);
+
+            for (int i = 0; i < stars.Length; i++)
+            {
+                if (stars[i] == null) continue;
+                StarFlipStep step = starFlipSteps[i];
+                Vector3 from = toEndRotation ? step.startRotation : step.endRotation;
+                Vector3 to = toEndRotation ? step.endRotation : step.startRotation;
+                stars[i].transform.localEulerAngles = Vector3.Lerp(from, to, easedProgress);
+            }
+
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 确保最终旋转精确
+        for (int i = 0; i < stars.Length; i++)
+        {
+            if (stars[i] == null) continue;
+            StarFlipStep step = starFlipSteps[i];
+            stars[i].transform.localEulerAngles = toEndRotation ? step.endRotation : step.startRotation;
+        }
+
+        // ====== 阶段2：所有星星同时上下左右跳动 ======
+        Vector3[] basePositions = new Vector3[stars.Length];
+        for (int i = 0; i < stars.Length; i++)
+        {
+            basePositions[i] = stars[i] != null ? stars[i].transform.localPosition : Vector3.zero;
+        }
+
+        elapsed = 0f;
+        while (elapsed < starBounceDuration)
+        {
+            for (int i = 0; i < stars.Length; i++)
+            {
+                if (stars[i] == null) continue;
+                // 上下弹跳（绝对值正弦波，模拟弹跳感）
+                float offsetY = Mathf.Abs(Mathf.Sin(elapsed * 8f)) * starBounceAmplitude;
+                // 左右摆动（正弦波，频率稍低）
+                float offsetX = Mathf.Sin(elapsed * 5f) * starBounceAmplitude * 0.6f;
+                stars[i].transform.localPosition = basePositions[i] + new Vector3(offsetX, offsetY, 0f);
+            }
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复所有星星的原始位置
+        for (int i = 0; i < stars.Length; i++)
+        {
+            if (stars[i] == null) continue;
+            stars[i].transform.localPosition = basePositions[i];
+        }
+
+        isStarFlipping = false;
+        Debug.Log("[GameLogic] FlipAllStarsSequence 完成，toEndRotation=" + toEndRotation);
+    }
+
+    // ============================================================
+    // [NEW] 背景音乐管理
+    // ============================================================
+
+    /// <summary>
+    /// 背景音乐管理协程
+    /// 在自动播放阶段，当没有物体进行交互时播放背景音乐
+    /// 当有物体开始运动时停止背景音乐
+    /// </summary>
+    private IEnumerator BackgroundMusicManager()
+    {
+        // 等待星星翻转阶段完全结束
+        while (starFlipPhaseActive)
+        {
+            yield return new WaitForSeconds(0.5f);
+        }
+
+        // 额外等待1秒，确保过渡平滑
+        yield return new WaitForSeconds(1f);
+
+        while (true)
+        {
+            // 检查是否有物体正在交互（activeCoroutines中有非StarBounce的条目）
+            bool hasActiveInteraction = false;
+            foreach (var key in activeCoroutines.Keys)
+            {
+                // 星星跳动协程不算"物体交互"
+                if (!key.StartsWith("StarBounce_") && !key.StartsWith("StarFlip_"))
+                {
+                    hasActiveInteraction = true;
+                    break;
+                }
+            }
+
+            if (!hasActiveInteraction && backgroundMusicClip != null && bgMusicAudioSource != null)
+            {
+                // 没有物体交互，播放背景音乐
+                if (!bgMusicAudioSource.isPlaying)
+                {
+                    bgMusicAudioSource.clip = backgroundMusicClip;
+                    bgMusicAudioSource.Play();
+                    Debug.Log("[GameLogic] 开始播放背景音乐");
+                }
+            }
+
+            yield return new WaitForSeconds(0.5f);
+        }
+    }
+
+    /// <summary>
+    /// 停止背景音乐
+    /// 在TriggerGameEvent中调用，当有物体开始运动时停止背景音乐
+    /// </summary>
+    private void StopBackgroundMusic()
+    {
+        if (bgMusicAudioSource != null && bgMusicAudioSource.isPlaying)
+        {
+            bgMusicAudioSource.Stop();
+            Debug.Log("[GameLogic] 停止背景音乐");
+        }
+    }
+
+    // ============================================================
+    // 自动随机播放
+    // ============================================================
+
+    /// <summary>
+    /// 重置所有事件的触发计数为0
+    /// </summary>
+    private void ResetTriggerCounts()
+    {
+        eventTriggerCounts.Clear();
+        foreach (GameEventType eventType in autoPlayEventPool)
+        {
+            eventTriggerCounts[eventType] = 0;
+        }
+    }
+
+    /// <summary>
+    /// 自动随机播放协程
+    /// 每隔autoPlayInterval秒从事件池中随机选取一个事件触发
+    /// 每个事件出现2次后重置，不可连续出现同一事件
+    /// </summary>
+    private IEnumerator AutoPlayCoroutine()
+    {
+        // 启动时等待1秒，让场景初始化完成
+        yield return new WaitForSeconds(1f);
+
+        while (autoPlayEnabled)
+        {
+            // 获取可用事件列表（触发次数 < 2）
+            List<GameEventType> available = new List<GameEventType>();
+            foreach (GameEventType et in autoPlayEventPool)
+            {
+                if (eventTriggerCounts[et] < 2)
+                    available.Add(et);
+            }
+
+            // 如果所有事件都已触发2次，重置计数并重新构建可用列表
+            if (available.Count == 0)
+            {
+                ResetTriggerCounts();
+                foreach (GameEventType et in autoPlayEventPool)
+                    available.Add(et);
+            }
+
+            // 过滤掉与上次相同的事件，避免连续重复
+            List<GameEventType> filtered = new List<GameEventType>();
+            foreach (GameEventType et in available)
+            {
+                if (et != lastTriggeredEvent)
+                    filtered.Add(et);
+            }
+
+            // 如果过滤后还有选项，使用过滤后的列表；否则使用未过滤的
+            if (filtered.Count > 0)
+                available = filtered;
+
+            // 随机选取一个事件
+            GameEventType selectedEvent = available[UnityEngine.Random.Range(0, available.Count)];
+
+            Debug.Log("[GameLogic] 自动播放触发事件: " + selectedEvent
+                + " (已触发次数: " + eventTriggerCounts[selectedEvent] + "/2)");
+
+            // 触发选中的事件
+            TriggerGameEvent(selectedEvent);
+            eventTriggerCounts[selectedEvent]++;
+            lastTriggeredEvent = selectedEvent;
+
+            // 等待指定间隔
+            yield return new WaitForSeconds(autoPlayInterval);
+        }
+    }
+
+    /// <summary>
+    /// 在Inspector中可以随时切换自动播放开关
+    /// </summary>
+    public void SetAutoPlayEnabled(bool enabled)
+    {
+        autoPlayEnabled = enabled;
+        if (enabled && autoPlayCoroutine == null)
+        {
+            autoPlayCoroutine = StartCoroutine(AutoPlayCoroutine());
+        }
+        else if (!enabled && autoPlayCoroutine != null)
+        {
+            StopCoroutine(autoPlayCoroutine);
+            autoPlayCoroutine = null;
+        }
+    }
+
+    // ============================================================
+    // 公开接口 - 供Link.cs调用
+    // ============================================================
+
+    /// <summary>
+    /// 接收并处理来自BCI平台的指令
+    /// 这是Link.cs解析完Socket.IO消息后调用的入口方法
+    /// </summary>
+    /// <param name="command">游戏指令对象</param>
+    public void OnReceiveCommand(GameCommand command)
+    {
+        if (command == null || string.IsNullOrEmpty(command.cmd))
+        {
+            Debug.LogWarning("[GameLogic] 收到空指令，忽略");
+            return;
+        }
+
+        Debug.Log("[GameLogic] 收到BCI指令: cmd=" + command.cmd
+            + ", param=" + command.param + ", intensity=" + command.intensity);
+
+        switch (command.cmd)
+        {
+            case "SELECT":
+                HandleP300Select(command.param);
+                break;
+
+            case "FORWARD":
+                Debug.Log("[GameLogic] 注意力前进，强度: " + command.intensity);
+                break;
+
+            case "BACKWARD":
+                Debug.Log("[GameLogic] 注意力后退，强度: " + command.intensity);
+                break;
+
+            case "IDLE":
+                break;
+
+            case "JUMP":
+                Debug.Log("[GameLogic] 眨眼跳跃");
+                break;
+
+            case "LEFT":
+            case "RIGHT":
+                Debug.Log("[GameLogic] 陀螺仪转向: " + command.cmd + "，强度: " + command.intensity);
+                break;
+
+            case "ACTION":
+                Debug.Log("[GameLogic] 运动想象动作: " + command.param);
+                break;
+
+            default:
+                Debug.LogWarning("[GameLogic] 未知指令类型: " + command.cmd);
+                break;
+        }
+    }
+
+    // ============================================================
+    // P300选择处理
+    // ============================================================
+
+    /// <summary>
+    /// 处理P300/SSVEP选择指令
+    /// 根据映射表将P300参数转换为对应的游戏事件
+    /// </summary>
+    /// <param name="param">P300识别输出的参数值</param>
+    private void HandleP300Select(string param)
+    {
+        if (string.IsNullOrEmpty(param))
+        {
+            Debug.LogWarning("[GameLogic] P300参数为空，忽略");
+            return;
+        }
+
+        GameEventType? foundEvent = null;
+        for (int i = 0; i < p300Mappings.Count; i++)
+        {
+            if (p300Mappings[i].p300Param == param)
+            {
+                foundEvent = p300Mappings[i].gameEvent;
+                break;
+            }
+        }
+
+        if (foundEvent == null)
+        {
+            Debug.LogWarning("[GameLogic] 未找到P300参数 '" + param + "' 的映射，请检查映射表配置");
+            return;
+        }
+
+        TriggerGameEvent(foundEvent.Value);
+    }
+
+    // ============================================================
+    // 游戏事件触发与分发
+    // ============================================================
+
+    /// <summary>
+    /// 触发指定的游戏事件
+    /// 每次触发新事件前，先停止上一个事件的所有动作和音频
+    /// </summary>
+    private void TriggerGameEvent(GameEventType eventType)
+    {
+        Debug.Log("[GameLogic] 触发游戏事件: " + eventType);
+
+        // [NEW] 物体开始运动时停止背景音乐
+        StopBackgroundMusic();
+
+        // 停止上一个事件的所有动作和音频
+        StopAllActiveEvents();
+
+        switch (eventType)
+        {
+            case GameEventType.PurpleLightOn:
+                OnPurpleLightOn();
+                break;
+            case GameEventType.PurpleLightOff:
+                OnPurpleLightOff();
+                break;
+            case GameEventType.PinkLightOn:
+                OnPinkLightOn();
+                break;
+            case GameEventType.PinkLightOff:
+                OnPinkLightOff();
+                break;
+            case GameEventType.AudienceApplause:
+                OnAudienceApplause();
+                break;
+            case GameEventType.AudienceChorus:
+                OnAudienceChorus();
+                break;
+            case GameEventType.DJOn:
+                OnDJOn();
+                break;
+            case GameEventType.DJOff:
+                OnDJOff();
+                break;
+            case GameEventType.TwoGirlsSpin:
+                OnTwoGirlsSpin();
+                break;
+            case GameEventType.DancerDance:
+                OnDancerDance();
+                break;
+            case GameEventType.SingerSing:
+                OnSingerSing();
+                break;
+            case GameEventType.PianoPlay:
+                OnPianoPlay();
+                break;
+        }
+    }
+
+    // ============================================================
+    // 停止所有活跃事件
+    // ============================================================
+
+    /// <summary>
+    /// 停止所有正在运行的动画协程和音频
+    /// 在每次触发新事件前调用，确保上一个事件完全停止
+    /// </summary>
+    private void StopAllActiveEvents()
+    {
+        // 停止所有活跃的动画/事件协程
+        foreach (var kvp in activeCoroutines)
+        {
+            if (kvp.Value != null)
+            {
+                StopCoroutine(kvp.Value);
+            }
+        }
+        activeCoroutines.Clear();
+
+        // 停止音频截断协程
+        if (audioStopCoroutine != null)
+        {
+            StopCoroutine(audioStopCoroutine);
+            audioStopCoroutine = null;
+        }
+
+        // 停止主AudioSource
+        if (audioSource != null && audioSource.isPlaying)
+        {
+            audioSource.Stop();
+        }
+
+        // 复位所有物体位置
+        ResetPosition(purerLight);
+        ResetPosition(pinkLight);
+        ResetPosition(djObject);
+        ResetPosition(piano);
+        ResetPosition(singer);
+        ResetPosition(audienceApplause);
+        ResetPosition(twoGirls2);
+        ResetPosition(dancer3);
+
+        // 复位所有物体旋转
+        ResetRotation(purerLight);
+        ResetRotation(pinkLight);
+        ResetRotation(djObject);
+        ResetRotation(piano);
+        ResetRotation(singer);
+        ResetRotation(audienceApplause);
+        ResetRotation(twoGirls2);
+        ResetRotation(dancer3);
+
+        // 灯光设为黑色（灭）
+        SetObjectBlack(purerLight);
+        SetObjectBlack(pinkLight);
+
+        // DJ亮度复位为暗
+        ResetObjectBrightness(djObject);
+        SetObjectBrightness(djObject, djDimMultiplier);
+
+        // 钢琴亮度复位
+        ResetObjectBrightness(piano);
+
+        isDJOn = false;
+
+        // 重置灯光状态
+        isPurpleLightOn = false;
+        isPinkLightOn = false;
+
+        // 恢复曝光为正常值
+        SetExposure(normalExposure);
+    }
+
+    // ============================================================
+    // 游戏事件处理方法
+    // ============================================================
+
+    /// <summary>
+    /// 紫灯亮 - Purer Light出现并上下跳动5s，伴随灯亮音效
+    /// 灯光显示后自动延时熄灭
+    /// </summary>
+    private void OnPurpleLightOn()
+    {
+        isPurpleLightOn = true;
+
+        // 恢复原始亮度并增强
+        ResetObjectBrightness(purerLight);
+        SetObjectBrightness(purerLight, lightBrightMultiplier);
+
+        // 紫灯亮时设置曝光为2.0
+        UpdateExposure();
+
+        // 播放灯亮音效（分段播放5s）
+        PlaySoundSegmented(lightOnClip, GameEventType.PurpleLightOn);
+
+        // 启动上下跳动动画（5s）
+        SafeStartCoroutine("PurpleLightBounce",
+            BounceUpDownCoroutine(purerLight, "PurpleLightBounce", lightBounceDuration, lightBounceAmplitude));
+
+        // 自动延时熄灭
+        SafeStartCoroutine("PurpleLightAutoOff",
+            AutoOffCoroutine("PurpleLightAutoOff", () => OnPurpleLightOff(), lightAutoOffDelay));
+    }
+
+    /// <summary>
+    /// 紫灯灭 - Purer Light变黑，伴随灯灭音效
+    /// </summary>
+    private void OnPurpleLightOff()
+    {
+        isPurpleLightOn = false;
+
+        // 停止跳动动画并复位位置
+        StopCoroutineSafe("PurpleLightBounce");
+        ResetPosition(purerLight);
+
+        // 停止自动熄灭协程（防止重复触发）
+        StopCoroutineSafe("PurpleLightAutoOff");
+
+        // 变黑
+        SetObjectBlack(purerLight);
+
+        // 灯灭时更新曝光
+        UpdateExposure();
+
+        // 播放灯灭音效（分段播放5s）
+        PlaySoundSegmented(lightOffClip, GameEventType.PurpleLightOff);
+    }
+
+    /// <summary>
+    /// 粉灯亮 - Pink Light出现并左右跳动5s，伴随灯亮音效
+    /// 灯光显示后自动延时熄灭
+    /// </summary>
+    private void OnPinkLightOn()
+    {
+        isPinkLightOn = true;
+
+        // 恢复原始亮度并增强
+        ResetObjectBrightness(pinkLight);
+        SetObjectBrightness(pinkLight, lightBrightMultiplier);
+
+        // 粉灯亮时设置曝光为1.5
+        UpdateExposure();
+
+        // 播放灯亮音效（分段播放5s）
+        PlaySoundSegmented(lightOnClip, GameEventType.PinkLightOn);
+
+        // 启动左右跳动动画（5s）
+        SafeStartCoroutine("PinkLightBounce",
+            BounceLeftRightCoroutine(pinkLight, "PinkLightBounce", lightBounceDuration, pinkLightBounceAmplitude));
+
+        // 自动延时熄灭
+        SafeStartCoroutine("PinkLightAutoOff",
+            AutoOffCoroutine("PinkLightAutoOff", () => OnPinkLightOff(), lightAutoOffDelay));
+    }
+
+    /// <summary>
+    /// 粉灯灭 - Pink Light变黑，伴随灯灭音效
+    /// </summary>
+    private void OnPinkLightOff()
+    {
+        isPinkLightOn = false;
+
+        // 停止跳动动画并复位位置
+        StopCoroutineSafe("PinkLightBounce");
+        ResetPosition(pinkLight);
+
+        // 停止自动熄灭协程（防止重复触发）
+        StopCoroutineSafe("PinkLightAutoOff");
+
+        // 变黑
+        SetObjectBlack(pinkLight);
+
+        // 灯灭时更新曝光
+        UpdateExposure();
+
+        // 播放灯灭音效（分段播放5s）
+        PlaySoundSegmented(lightOffClip, GameEventType.PinkLightOff);
+    }
+
+    /// <summary>
+    /// 观众鼓掌 - 播放掌声音效，观众物体上下+左右持续晃动5s（幅度大）
+    /// </summary>
+    private void OnAudienceApplause()
+    {
+        PlaySoundSegmented(applauseClip, GameEventType.AudienceApplause);
+        SafeStartCoroutine("AudienceApplause",
+            AudienceCombinedCoroutine(audienceApplause, "AudienceApplause", audienceDuration,
+                audienceBounceAmplitude, audienceSwayAmplitude));
+    }
+
+    /// <summary>
+    /// 观众合唱 - 播放合唱音效，观众物体上下+左右持续晃动5s（幅度大）
+    /// </summary>
+    private void OnAudienceChorus()
+    {
+        PlaySoundSegmented(chorusClip, GameEventType.AudienceChorus);
+        SafeStartCoroutine("AudienceChorus",
+            AudienceCombinedCoroutine(audienceApplause, "AudienceChorus", audienceDuration,
+                audienceBounceAmplitude, audienceSwayAmplitude));
+    }
+
+    /// <summary>
+    /// DJ开 - 播放DJ音效，DJ物体上下跳动5s
+    /// </summary>
+    private void OnDJOn()
+    {
+        isDJOn = true;
+
+        // 播放DJ音效（分段播放5s）
+        PlaySoundSegmented(djClip, GameEventType.DJOn);
+
+        // DJ更亮
+        SetObjectBrightness(djObject, djBrightMultiplier);
+
+        // 启动上下跳动动画（5s）
+        SafeStartCoroutine("DJBounce",
+            BounceUpDownCoroutine(djObject, "DJBounce", djBounceDuration, djBounceAmplitude));
+
+        // 自动延时关闭
+        SafeStartCoroutine("DJAutoOff",
+            AutoOffCoroutine("DJAutoOff", () => OnDJOff(), djAutoOffDelay));
+    }
+
+    /// <summary>
+    /// DJ关 - 关闭DJ音效，DJ物体稍微更暗
+    /// </summary>
+    private void OnDJOff()
+    {
+        isDJOn = false;
+
+        // 停止跳动动画并复位位置
+        StopCoroutineSafe("DJBounce");
+        ResetPosition(djObject);
+
+        // 停止自动关闭协程（防止重复触发）
+        StopCoroutineSafe("DJAutoOff");
+
+        // 停止音频
+        if (audioSource != null && audioSource.isPlaying)
+        {
+            audioSource.Stop();
+        }
+
+        // DJ更暗
+        SetObjectBrightness(djObject, djDimMultiplier);
+    }
+
+    /// <summary>
+    /// 二人转 - TwoGirls2在5s内一直旋转，配上音效
+    /// </summary>
+    private void OnTwoGirlsSpin()
+    {
+        PlaySoundSegmented(twoGirlsClip, GameEventType.TwoGirlsSpin);
+        SafeStartCoroutine("TwoGirlsSpin",
+            TwoGirlsContinuousSpinCoroutine(twoGirls2, "TwoGirlsSpin", twoGirlsSpinDuration, twoGirlsRotations));
+    }
+
+    /// <summary>
+    /// 人跳舞 - Dancer3在5s内上下左右+转圈持续进行，配上音效
+    /// </summary>
+    private void OnDancerDance()
+    {
+        PlaySoundSegmented(dancerClip, GameEventType.DancerDance);
+        SafeStartCoroutine("DancerDance",
+            DancerContinuousCoroutine(dancer3, "DancerDance", dancerDuration,
+                dancerVerticalAmplitude, dancerHorizontalAmplitude, dancerRotations));
+    }
+
+    /// <summary>
+    /// 人唱歌 - Singer在5s内先转一圈，然后左右摇晃像歌手一样，配上歌曲音效
+    /// </summary>
+    private void OnSingerSing()
+    {
+        PlaySoundSegmented(singerClip, GameEventType.SingerSing);
+        SafeStartCoroutine("SingerSing",
+            SingerPerformCoroutine(singer, "SingerSing", singerDuration,
+                singerSwayAmplitude, singerRotateDuration));
+    }
+
+    /// <summary>
+    /// 钢琴响 - 播放Piano音效，Piano轻柔晃动（幅度较大），Piano物体稍微更亮
+    /// 亮度在一段时间后自动恢复
+    /// </summary>
+    private void OnPianoPlay()
+    {
+        PlaySoundSegmented(pianoClip, GameEventType.PianoPlay);
+
+        // Piano稍微更亮
+        SetObjectBrightness(piano, pianoBrightMultiplier);
+
+        // Piano轻柔晃动（幅度较大，5s内持续）
+        SafeStartCoroutine("PianoSway",
+            GentleSwayCoroutine(piano, "PianoSway", pianoSwayDuration, pianoSwayAmplitude));
+
+        // 钢琴亮度在一段时间后恢复
+        SafeStartCoroutine("PianoBrightness",
+            ResetBrightnessAfterDelay(piano, "PianoBrightness", pianoBrightResetDelay));
+    }
+
+    // ============================================================
+    // 音效播放工具方法（分段播放版本）
+    // ============================================================
+
+    /// <summary>
+    /// 分段播放音效
+    /// 第一次播放0-5s，第二次接续5-10s，以此类推
+    /// 如果起始时间超过音频长度，则从头开始
+    /// </summary>
+    private void PlaySoundSegmented(AudioClip clip, GameEventType eventType)
+    {
+        if (clip == null)
+        {
+            Debug.LogWarning("[GameLogic] 尝试播放音效但AudioClip为空");
+            return;
+        }
+
+        if (audioSource == null)
+        {
+            Debug.LogWarning("[GameLogic] 主AudioSource未就绪");
+            return;
+        }
+
+        // 如果当前正在播放，先停止
+        if (audioSource.isPlaying)
+        {
+            audioSource.Stop();
+        }
+
+        // 停止之前的截断协程
+        if (audioStopCoroutine != null)
+        {
+            StopCoroutine(audioStopCoroutine);
+            audioStopCoroutine = null;
+        }
+
+        // 获取或初始化该事件类型的播放计数
+        if (!audioPlayCounts.ContainsKey(eventType))
+        {
+            audioPlayCounts[eventType] = 0;
+        }
+
+        // 计算本次播放的起始时间
+        float startTime = audioPlayCounts[eventType] * maxAudioDuration;
+
+        // 如果起始时间超过音频长度，从头开始
+        if (startTime >= clip.length)
+        {
+            startTime = 0f;
+            audioPlayCounts[eventType] = 0;
+        }
+
+        // 播放音频从计算出的起始时间开始
+        audioSource.clip = clip;
+        audioSource.loop = false;
+        audioSource.time = startTime;
+        audioSource.Play();
+
+        // 计算本段可播放时长
+        float remainingInClip = clip.length - startTime;
+        float playDuration = Mathf.Min(maxAudioDuration, remainingInClip);
+
+        Debug.Log("[GameLogic] 播放音频 '" + clip.name + "' 片段 #" + (audioPlayCounts[eventType] + 1)
+            + ": " + startTime.ToString("F1") + "s - " + (startTime + playDuration).ToString("F1") + "s"
+            + " (总长: " + clip.length.ToString("F1") + "s)");
+
+        // 启动自动截断协程
+        audioStopCoroutine = StartCoroutine(StopMainAudioAfterDelay(playDuration));
+
+        // 递增播放计数
+        audioPlayCounts[eventType]++;
+    }
+
+    /// <summary>
+    /// 延迟停止主AudioSource的协程
+    /// </summary>
+    private IEnumerator StopMainAudioAfterDelay(float delay)
+    {
+        yield return new WaitForSeconds(delay);
+        if (audioSource != null && audioSource.isPlaying)
+        {
+            audioSource.Stop();
+        }
+        audioStopCoroutine = null;
+    }
+
+    // ============================================================
+    // 材质亮度控制
+    // ============================================================
+
+    /// <summary>
+    /// 记录物体原始材质颜色（主色和Emission色）
+    /// </summary>
+    private void StoreOriginalColor(GameObject obj)
+    {
+        if (obj == null) return;
+
+        Renderer renderer = obj.GetComponent<Renderer>();
+        if (renderer == null || renderer.material == null) return;
+
+        Material mat = renderer.material;
+
+        if (mat.HasProperty("_Color"))
+        {
+            originalColors[obj] = mat.GetColor("_Color");
+        }
+
+        if (mat.HasProperty("_EmissionColor"))
+        {
+            originalEmissions[obj] = mat.GetColor("_EmissionColor");
+        }
+    }
+
+    /// <summary>
+    /// 设置物体亮度
+    /// 优先使用Emission属性（更亮），如果材质不支持Emission则调整主颜色
+    /// multiplier > 1 变亮，< 1 变暗
+    /// </summary>
+    private void SetObjectBrightness(GameObject obj, float multiplier)
+    {
+        if (obj == null) return;
+
+        Renderer renderer = obj.GetComponent<Renderer>();
+        if (renderer == null || renderer.material == null) return;
+
+        Material mat = renderer.material;
+
+        // 优先使用Emission属性（Standard Shader支持）
+        if (mat.HasProperty("_EmissionColor"))
+        {
+            mat.EnableKeyword("_EMISSION");
+
+            Color baseEmission;
+            if (originalEmissions.ContainsKey(obj))
+            {
+                baseEmission = originalEmissions[obj];
+            }
+            else
+            {
+                baseEmission = mat.GetColor("_EmissionColor");
+            }
+
+            Color newEmission = baseEmission * multiplier;
+            mat.SetColor("_EmissionColor", newEmission);
+        }
+
+        // 同时调整主颜色亮度
+        if (mat.HasProperty("_Color"))
+        {
+            Color baseColor;
+            if (originalColors.ContainsKey(obj))
+            {
+                baseColor = originalColors[obj];
+            }
+            else
+            {
+                baseColor = mat.GetColor("_Color");
+            }
+
+            float r = Mathf.Clamp01(baseColor.r * multiplier);
+            float g = Mathf.Clamp01(baseColor.g * multiplier);
+            float b = Mathf.Clamp01(baseColor.b * multiplier);
+            mat.SetColor("_Color", new Color(r, g, b, baseColor.a));
+        }
+    }
+
+    /// <summary>
+    /// 将物体设置为黑色（灯灭状态）
+    /// 同时禁用Emission，使物体完全变黑
+    /// </summary>
+    private void SetObjectBlack(GameObject obj)
+    {
+        if (obj == null) return;
+
+        Renderer renderer = obj.GetComponent<Renderer>();
+        if (renderer == null || renderer.material == null) return;
+
+        Material mat = renderer.material;
+
+        if (mat.HasProperty("_Color"))
+        {
+            mat.SetColor("_Color", new Color(0f, 0f, 0f, 1f));
+        }
+
+        if (mat.HasProperty("_EmissionColor"))
+        {
+            mat.SetColor("_EmissionColor", Color.black);
+            mat.DisableKeyword("_EMISSION");
+        }
+    }
+
+    /// <summary>
+    /// 恢复物体原始亮度
+    /// </summary>
+    private void ResetObjectBrightness(GameObject obj)
+    {
+        if (obj == null) return;
+
+        Renderer renderer = obj.GetComponent<Renderer>();
+        if (renderer == null || renderer.material == null) return;
+
+        Material mat = renderer.material;
+
+        // 恢复Emission
+        if (mat.HasProperty("_EmissionColor"))
+        {
+            if (originalEmissions.ContainsKey(obj))
+            {
+                mat.SetColor("_EmissionColor", originalEmissions[obj]);
+                mat.EnableKeyword("_EMISSION");
+            }
+            else
+            {
+                mat.SetColor("_EmissionColor", Color.black);
+            }
+        }
+
+        // 恢复主颜色
+        if (mat.HasProperty("_Color"))
+        {
+            if (originalColors.ContainsKey(obj))
+            {
+                mat.SetColor("_Color", originalColors[obj]);
+            }
+        }
+    }
+
+    // ============================================================
+    // 位置与旋转管理
+    // ============================================================
+
+    /// <summary>
+    /// 记录物体原始位置
+    /// </summary>
+    private void StoreOriginalPosition(GameObject obj)
+    {
+        if (obj != null)
+        {
+            originalPositions[obj] = obj.transform.localPosition;
+        }
+    }
+
+    /// <summary>
+    /// 恢复物体原始位置
+    /// </summary>
+    private void ResetPosition(GameObject obj)
+    {
+        if (obj != null && originalPositions.ContainsKey(obj))
+        {
+            obj.transform.localPosition = originalPositions[obj];
+        }
+    }
+
+    /// <summary>
+    /// 记录物体原始旋转
+    /// </summary>
+    private void StoreOriginalRotation(GameObject obj)
+    {
+        if (obj != null)
+        {
+            originalRotations[obj] = obj.transform.localRotation;
+        }
+    }
+
+    /// <summary>
+    /// 恢复物体原始旋转
+    /// </summary>
+    private void ResetRotation(GameObject obj)
+    {
+        if (obj != null && originalRotations.ContainsKey(obj))
+        {
+            obj.transform.localRotation = originalRotations[obj];
+        }
+    }
+
+    // ============================================================
+    // 协程管理
+    // ============================================================
+
+    /// <summary>
+    /// 安全启动协程：如果同名协程已在运行则先停止再重启
+    /// </summary>
+    private void SafeStartCoroutine(string key, IEnumerator routine)
+    {
+        if (activeCoroutines.ContainsKey(key) && activeCoroutines[key] != null)
+        {
+            StopCoroutine(activeCoroutines[key]);
+        }
+        activeCoroutines[key] = StartCoroutine(routine);
+    }
+
+    /// <summary>
+    /// 安全停止协程：停止指定key的协程并从字典中移除
+    /// </summary>
+    private void StopCoroutineSafe(string key)
+    {
+        if (activeCoroutines.ContainsKey(key) && activeCoroutines[key] != null)
+        {
+            StopCoroutine(activeCoroutines[key]);
+        }
+        activeCoroutines.Remove(key);
+    }
+
+    // ============================================================
+    // 动画协程
+    // ============================================================
+
+    /// <summary>
+    /// 自动熄灭/关闭协程
+    /// 延迟指定时间后自动触发关闭动作
+    /// </summary>
+    private IEnumerator AutoOffCoroutine(string key, Action offAction, float delay)
+    {
+        yield return new WaitForSeconds(delay);
+        offAction.Invoke();
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 上下跳动协程（紫灯、DJ使用）
+    /// 使用正弦波实现平滑的上下弹跳效果
+    /// </summary>
+    private IEnumerator BounceUpDownCoroutine(GameObject obj, string key, float duration, float amplitude)
+    {
+        if (obj == null) yield break;
+
+        Vector3 originalPos = obj.transform.localPosition;
+        float elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            float offsetY = Mathf.Sin(elapsed * 6f) * amplitude;
+            obj.transform.localPosition = originalPos + new Vector3(0f, offsetY, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始位置
+        obj.transform.localPosition = originalPos;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 左右跳动协程（粉灯使用）
+    /// 使用正弦波实现平滑的左右弹跳效果
+    /// </summary>
+    private IEnumerator BounceLeftRightCoroutine(GameObject obj, string key, float duration, float amplitude)
+    {
+        if (obj == null) yield break;
+
+        Vector3 originalPos = obj.transform.localPosition;
+        float elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            float offsetX = Mathf.Sin(elapsed * 6f) * amplitude;
+            obj.transform.localPosition = originalPos + new Vector3(offsetX, 0f, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始位置
+        obj.transform.localPosition = originalPos;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 观众组合晃动协程（鼓掌+合唱使用）
+    /// 5s内上下+左右持续晃动，幅度较大
+    /// 使用不同频率的正弦波实现上下和左右的组合晃动
+    /// </summary>
+    private IEnumerator AudienceCombinedCoroutine(GameObject obj, string key, float duration,
+        float bounceAmplitude, float swayAmplitude)
+    {
+        if (obj == null) yield break;
+
+        Vector3 originalPos = obj.transform.localPosition;
+        float elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            // 上下晃动（使用绝对值正弦波模拟弹跳感）
+            float offsetY = Mathf.Abs(Mathf.Sin(elapsed * 5f)) * bounceAmplitude;
+            // 左右晃动（使用正弦波实现平滑摆动）
+            float offsetX = Mathf.Sin(elapsed * 4f) * swayAmplitude;
+            obj.transform.localPosition = originalPos + new Vector3(offsetX, offsetY, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始位置
+        obj.transform.localPosition = originalPos;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 歌手表演协程
+    /// 5s内先转一圈（约1.5s），然后左右摇晃像歌手一样（剩余时间）
+    /// </summary>
+    private IEnumerator SingerPerformCoroutine(GameObject obj, string key, float duration,
+        float swayAmplitude, float rotateDuration)
+    {
+        if (obj == null) yield break;
+
+        Vector3 originalPos = obj.transform.localPosition;
+        Quaternion originalRot = obj.transform.localRotation;
+        float elapsed = 0f;
+
+        // 阶段1：转一圈（360度旋转）
+        float actualRotateDuration = Mathf.Min(rotateDuration, duration);
+        while (elapsed < actualRotateDuration)
+        {
+            float progress = elapsed / actualRotateDuration;
+            // 使用缓入缓出使旋转更自然
+            float easedProgress = progress * progress * (3f - 2f * progress);
+            float angle = easedProgress * 360f;
+            obj.transform.localRotation = originalRot * Quaternion.Euler(0f, angle, 0f);
+            obj.transform.localPosition = originalPos;
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 确保旋转完成，回到原始旋转
+        obj.transform.localRotation = originalRot;
+
+        // 阶段2：左右摇晃像歌手一样（剩余时间）
+        while (elapsed < duration)
+        {
+            float timeInSway = elapsed - actualRotateDuration;
+            float offsetX = Mathf.Sin(timeInSway * 4f) * swayAmplitude;
+            obj.transform.localPosition = originalPos + new Vector3(offsetX, 0f, 0f);
+            // 保持原始旋转（不继续转）
+            obj.transform.localRotation = originalRot;
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始位置和旋转
+        obj.transform.localPosition = originalPos;
+        obj.transform.localRotation = originalRot;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 二人转持续旋转协程
+    /// 5s内一直旋转，使用匀速旋转实现持续转圈效果
+    /// </summary>
+    private IEnumerator TwoGirlsContinuousSpinCoroutine(GameObject obj, string key, float duration, int rotations)
+    {
+        if (obj == null) yield break;
+
+        Quaternion originalRot = obj.transform.localRotation;
+        float totalAngle = rotations * 360f;
+        float elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            // 匀速旋转，5s内一直转
+            float progress = elapsed / duration;
+            float currentAngle = progress * totalAngle;
+            obj.transform.localRotation = originalRot * Quaternion.Euler(0f, currentAngle, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始旋转
+        obj.transform.localRotation = originalRot;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 舞者持续跳动协程
+    /// 5s内上下左右+转圈持续进行
+    /// 使用不同频率的正弦波组合实现上下左右运动，同时匀速旋转
+    /// </summary>
+    private IEnumerator DancerContinuousCoroutine(GameObject obj, string key, float duration,
+        float verticalAmplitude, float horizontalAmplitude, int rotations)
+    {
+        if (obj == null) yield break;
+
+        Vector3 originalPos = obj.transform.localPosition;
+        Quaternion originalRot = obj.transform.localRotation;
+        float elapsed = 0f;
+        float totalAngle = rotations * 360f;
+
+        while (elapsed < duration)
+        {
+            // 上下跳动（较高频率）
+            float offsetY = Mathf.Sin(elapsed * 6f) * verticalAmplitude;
+            // 左右跳动（不同频率，产生丰富的运动感）
+            float offsetX = Mathf.Sin(elapsed * 4f) * horizontalAmplitude;
+            // 持续旋转
+            float progress = elapsed / duration;
+            float angle = progress * totalAngle;
+
+            obj.transform.localPosition = originalPos + new Vector3(offsetX, offsetY, 0f);
+            obj.transform.localRotation = originalRot * Quaternion.Euler(0f, angle, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始位置和旋转
+        obj.transform.localPosition = originalPos;
+        obj.transform.localRotation = originalRot;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 温柔晃动协程（钢琴使用）
+    /// 使用低频正弦+余弦组合实现温柔的晃动效果，幅度较大
+    /// 5s内持续晃动
+    /// </summary>
+    private IEnumerator GentleSwayCoroutine(GameObject obj, string key, float duration, float amplitude)
+    {
+        if (obj == null) yield break;
+
+        Vector3 originalPos = obj.transform.localPosition;
+        float elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            // 低频正弦波实现温柔左右晃动（幅度较大）
+            float offsetX = Mathf.Sin(elapsed * 2f) * amplitude;
+            // 轻微的上下浮动增加温柔感
+            float offsetY = Mathf.Cos(elapsed * 1.5f) * amplitude * 0.5f;
+            obj.transform.localPosition = originalPos + new Vector3(offsetX, offsetY, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始位置
+        obj.transform.localPosition = originalPos;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 左右晃动协程（通用，保留供P300等外部调用）
+    /// 使用正弦波实现平滑的左右摆动效果
+    /// </summary>
+    private IEnumerator SwayCoroutine(GameObject obj, string key, float duration, float amplitude)
+    {
+        if (obj == null) yield break;
+
+        Vector3 originalPos = obj.transform.localPosition;
+        float elapsed = 0f;
+
+        while (elapsed < duration)
+        {
+            float offsetX = Mathf.Sin(elapsed * 5f) * amplitude;
+            obj.transform.localPosition = originalPos + new Vector3(offsetX, 0f, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 动画结束后恢复原始位置
+        obj.transform.localPosition = originalPos;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 二人转旋转协程（缓入缓出版本，保留供P300等外部调用）
+    /// TwoGirls2绕Y轴旋转指定圈数，使用缓入缓出使旋转更自然
+    /// </summary>
+    private IEnumerator RotateCoroutine(GameObject obj, string key, int rotations, float duration)
+    {
+        if (obj == null) yield break;
+
+        float totalAngle = rotations * 360f;
+        float elapsed = 0f;
+        Quaternion originalRotation = obj.transform.localRotation;
+
+        while (elapsed < duration)
+        {
+            float progress = elapsed / duration;
+            // 使用缓入缓出使旋转更自然
+            float easedProgress = progress * progress * (3f - 2f * progress);
+            float currentAngle = easedProgress * totalAngle;
+            obj.transform.localRotation = Quaternion.Euler(0f, currentAngle, 0f);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // 确保最终角度精确，旋转后回到原位
+        obj.transform.localRotation = originalRotation;
+        activeCoroutines.Remove(key);
+    }
+
+    /// <summary>
+    /// 延迟恢复亮度协程
+    /// 在指定时间后将物体亮度恢复到原始值
+    /// </summary>
+    private IEnumerator ResetBrightnessAfterDelay(GameObject obj, string key, float delay)
+    {
+        yield return new WaitForSeconds(delay);
+        ResetObjectBrightness(obj);
+        activeCoroutines.Remove(key);
+    }
+
+    // ============================================================
+    // 曝光控制方法
+    // ============================================================
+
+    /// <summary>
+    /// 设置场景曝光值
+    /// 通过修改Skybox材质的_Exposure属性来控制全局曝光
+    /// 如果使用URP/HDRP，可在此方法中替换为Volume组件的曝光控制
+    /// </summary>
+    private void SetExposure(float exposureValue)
+    {
+        // 方式1：通过Skybox材质设置曝光（适用于使用Skybox的场景）
+        if (RenderSettings.skybox != null)
+        {
+            RenderSettings.skybox.SetFloat("_Exposure", exposureValue);
+        }
+
+        // 方式2：通过环境光强度辅助调节
+        RenderSettings.ambientIntensity = exposureValue;
+
+        Debug.Log("[GameLogic] 曝光值设置为: " + exposureValue);
+    }
+
+    /// <summary>
+    /// 根据当前灯光状态更新曝光值
+    /// 优先级：紫灯亮(2.0) > 粉灯亮(1.5) > 灯灭(0.5) > 正常(1.0)
+    /// 当两个灯都灭时，曝光设为0.5；当没有任何灯事件触发时，曝光为正常值1.0
+    /// </summary>
+    private void UpdateExposure()
+    {
+        if (isPurpleLightOn)
+        {
+            // 紫灯亮，曝光最高优先级
+            SetExposure(purpleLightExposure);
+        }
+        else if (isPinkLightOn)
+        {
+            // 粉灯亮（紫灯已灭）
+            SetExposure(pinkLightExposure);
+        }
+        else
+        {
+            // 两个灯都灭了，曝光降低
+            SetExposure(lightOffExposure);
+        }
+    }
+
+    // ============================================================
+    // 星星出场相关方法
+    // ============================================================
+
+    /// <summary>
+    /// 隐藏星星物体
+    /// </summary>
+    private void HideStar(GameObject star)
+    {
+        if (star != null)
+        {
+            star.SetActive(false);
+        }
+    }
+
+    /// <summary>
+    /// 显示星星物体
+    /// </summary>
+    private void ShowStar(GameObject star)
+    {
+        if (star != null)
+        {
+            star.SetActive(true);
+        }
+    }
+
+    /// <summary>
+    /// 星星依次出场协程
+    /// 7颗星星依次出现，每颗出现时播放音效提示
+    /// [NEW] 全部出现后播放18s规则语音，然后进入旋前旋后星星翻转阶段
+    /// 翻转全部完成后启动自动播放协程
+    /// </summary>
+    private IEnumerator StarAppearanceSequence()
+    {
+        // 将所有星星存入数组方便遍历
+        GameObject[] stars = new GameObject[] { star1, star2, star3, star4, star5, star6, star7 };
+
+        for (int i = 0; i < stars.Length; i++)
+        {
+            // 显示当前星星
+            ShowStar(stars[i]);
+
+            // 播放星星出现音效
+            if (starAppearClip != null && audioSource != null)
+            {
+                audioSource.PlayOneShot(starAppearClip);
+            }
+
+            Debug.Log("[GameLogic] 星星" + (i + 1) + " 出现！");
+
+            // 等待指定间隔后显示下一颗
+            yield return new WaitForSeconds(starAppearInterval);
+        }
+
+        // 星星出场序列完成
+        starSequenceComplete = true;
+
+        // ====== 规则语音提示阶段 ======
+        Debug.Log("[GameLogic] 星星出场完成，开始播放游戏规则语音...");
+        if (audioSource != null && audioSource.isPlaying)
+        {
+            audioSource.Stop();
+        }
+        if (ruleAnnouncementClip != null && audioSource != null)
+        {
+            audioSource.clip = ruleAnnouncementClip;
+            audioSource.loop = false;
+            audioSource.Play();
+            Debug.Log("[GameLogic] 正在播放游戏规则语音，时长: " + ruleAnnouncementClip.length + "秒");
+            yield return new WaitWhile(() => audioSource != null && audioSource.isPlaying);
+            Debug.Log("[GameLogic] 规则语音播放完毕");
+        }
+        else
+        {
+            Debug.LogWarning("[GameLogic] 规则语音AudioClip未配置，跳过");
+        }
+
+        // ====== 7步旋前+旋后星星翻转阶段 ======
+        // 每一步：等用户做一次旋前+一次旋后 → 对应星星翻转180度+音效+跳动
+        Debug.Log("[GameLogic] 进入7步旋前旋后星星翻转阶段！");
+
+        for (int step = 0; step < starFlipSteps.Length; step++)
+        {
+            StarFlipStep flipStep = starFlipSteps[step];
+            if (flipStep.star == null)
+            {
+                Debug.LogWarning("[GameLogic] 步骤 " + (step + 1) + " 星星为空，跳过");
+                continue;
+            }
+
+            // --- 等待旋前 ---
+            Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.ResetGestureState();
+            Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.ResetDetectionFlags();
+            Debug.Log("[GameLogic] 步骤" + (step + 1) + "/7：等待旋前...");
+            yield return new WaitUntil(() =>
+                Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.pronationDetected ||
+                Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.GetCurrentOrientationStatic() == "Pronation"
+            );
+            Debug.Log("[GameLogic] 步骤" + (step + 1) + "/7：★ 接收到旋前！");
+
+            // --- 等待旋后 ---
+            Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.ResetGestureState();
+            Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.ResetDetectionFlags();
+            Debug.Log("[GameLogic] 步骤" + (step + 1) + "/7：等待旋后...");
+            yield return new WaitUntil(() =>
+                Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.supinationDetected ||
+                Mediapipe.Unity.Sample.HandLandmarkDetection.HandTracking.GetCurrentOrientationStatic() == "Supination"
+            );
+            Debug.Log("[GameLogic] 步骤" + (step + 1) + "/7：★ 接收到旋后！");
+
+            // --- 旋前+旋后完成，翻转星星 ---
+            // 播放鼓励音效
+            if (starFlipEncouragementClip != null && audioSource != null)
+            {
+                audioSource.PlayOneShot(starFlipEncouragementClip);
+            }
+
+            // 星星rotation翻转180度（绕Y轴）
+            yield return StartCoroutine(FlipStar180Coroutine(flipStep.star, flipStep.startRotation, flipStep.endRotation, flipStep.stepName));
+
+            // 星星上下左右跳动
+            yield return StartCoroutine(StarBounceCoroutine(flipStep.star, "StarBounce_" + flipStep.stepName, starBounceDuration, starBounceAmplitude));
+
+            Debug.Log("[GameLogic] ★ " + flipStep.stepName + " 翻转成功！");
+
+            // 短暂间隔
+            yield return new WaitForSeconds(0.3f);
+        }
+
+        // ====== 7步翻转全部完成，进入自动播放阶段 ======
+        Debug.Log("[GameLogic] 7步星星翻转全部完成！进入自动播放阶段...");
+        starFlipPhaseActive = false;
+
+        // 启动背景音乐管理
+        if (bgMusicManagerCoroutine != null)
+        {
+            StopCoroutine(bgMusicManagerCoroutine);
+        }
+        bgMusicManagerCoroutine = StartCoroutine(BackgroundMusicManager());
+
+        // 启动自动播放
+        if (autoPlayEnabled)
+        {
+            autoPlayCoroutine = StartCoroutine(AutoPlayCoroutine());
+        }
+    }
+}
